@@ -202,19 +202,33 @@ class BaseMailProvider:
 
 class CloudflareTempMailProvider(BaseMailProvider):
     name = "cloudflare_temp_email"
+    retry_statuses = {429, 500, 502, 503, 504}
 
     def __init__(self, entry: dict, conf: dict):
         super().__init__(conf, str(entry.get("provider_ref") or ""))
         self.api_base = str(entry["api_base"]).rstrip("/")
         self.admin_password = str(entry["admin_password"]).strip()
         self.domain = entry.get("domain") or []
-        self.session = curl_requests.Session(impersonate="chrome")
+        self.session = requests.Session()
 
     def _request(self, method: str, path: str, headers: dict | None = None, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200,)):
-        resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers={"Content-Type": "application/json", "User-Agent": self.conf["user_agent"], **(headers or {})}, params=params, json=payload, timeout=self.conf["request_timeout"], verify=False)
-        if resp.status_code not in expected:
+        last_error = ""
+        for attempt in range(3):
+            try:
+                resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers={"Content-Type": "application/json", "User-Agent": self.conf["user_agent"], **(headers or {})}, params=params, json=payload, timeout=self.conf["request_timeout"], verify=False)
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"CloudflareTempMail 请求异常: {method} {path}, error={last_error}") from exc
+            if resp.status_code in expected:
+                return {} if resp.status_code == 204 else resp.json()
+            if resp.status_code in self.retry_statuses and attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
             raise RuntimeError(f"CloudflareTempMail 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
-        return {} if resp.status_code == 204 else resp.json()
+        raise RuntimeError(f"CloudflareTempMail 请求异常: {method} {path}, error={last_error}")
 
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
         data = self._request("POST", "/admin/new_address", headers={"x-admin-auth": self.admin_password}, payload={"enablePrefix": True, "name": username or _random_mailbox_name(), "domain": _next_domain(self.domain)})
@@ -223,6 +237,9 @@ class CloudflareTempMailProvider(BaseMailProvider):
         if not address or not token:
             raise RuntimeError("CloudflareTempMail 缺少 address 或 jwt")
         return {"provider": self.name, "provider_ref": self.provider_ref, "address": address, "token": token}
+
+    def close(self) -> None:
+        self.session.close()
 
     def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
         data = self._request("GET", "/api/mails", headers={"Authorization": f"Bearer {mailbox['token']}"}, params={"limit": 10, "offset": 0})

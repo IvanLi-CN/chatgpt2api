@@ -63,6 +63,31 @@ class OpenAIRegisterLoginFlowTests(unittest.TestCase):
         exchange.assert_called_once()
         self.assertFalse(any("/api/accounts/password/verify" in url for _, url in session.calls))
 
+    def test_build_sentinel_token_retries_transient_ssl_failure(self):
+        class SentinelResponse:
+            status_code = 200
+
+            def json(self):
+                return {"token": "sentinel-token", "proofofwork": {"required": False}}
+
+        class SentinelSession:
+            def __init__(self):
+                self.calls = 0
+
+            def post(self, *args, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise openai_register.requests.exceptions.SSLError("unexpected eof")
+                return SentinelResponse()
+
+        session = SentinelSession()
+
+        with mock.patch.object(openai_register.SentinelTokenGenerator, "generate_requirements_token", return_value="req-token"):
+            token = openai_register.build_sentinel_token(session, "device-1", "password_verify")
+
+        self.assertIn("sentinel-token", token)
+        self.assertEqual(session.calls, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

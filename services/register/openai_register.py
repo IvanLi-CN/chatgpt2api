@@ -269,25 +269,41 @@ class SentinelTokenGenerator:
 
 def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> str:
     generator = SentinelTokenGenerator(device_id, user_agent)
-    resp = session.post(
-        "https://sentinel.openai.com/backend-api/sentinel/req",
-        data=json.dumps({"p": generator.generate_requirements_token(), "id": device_id, "flow": flow}),
-        headers={
-            "Content-Type": "text/plain;charset=UTF-8",
-            "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
-            "Origin": "https://sentinel.openai.com",
-            "User-Agent": user_agent,
-            "sec-ch-ua": sec_ch_ua,
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-        },
-        timeout=20,
-        verify=False,
-    )
+    resp = None
+    last_error = ""
+    for attempt in range(3):
+        try:
+            resp = session.post(
+                "https://sentinel.openai.com/backend-api/sentinel/req",
+                data=json.dumps({"p": generator.generate_requirements_token(), "id": device_id, "flow": flow}),
+                headers={
+                    "Content-Type": "text/plain;charset=UTF-8",
+                    "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
+                    "Origin": "https://sentinel.openai.com",
+                    "User-Agent": user_agent,
+                    "sec-ch-ua": sec_ch_ua,
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
+                },
+                timeout=20,
+                verify=False,
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            raise RuntimeError(f"sentinel_req_error: {last_error}") from exc
+        if resp.status_code == 200:
+            break
+        if resp.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+            time.sleep(0.5 * (attempt + 1))
+            continue
+        break
     data = _response_json(resp)
     token = str(data.get("token") or "").strip()
-    if resp.status_code != 200 or not token:
-        raise RuntimeError(f"sentinel_req_failed_{resp.status_code}")
+    if resp is None or resp.status_code != 200 or not token:
+        raise RuntimeError(f"sentinel_req_failed_{getattr(resp, 'status_code', 'unknown')}")
     pow_data = data.get("proofofwork") or {}
     p_value = (
         generator.generate_token(str(pow_data.get("seed") or ""), str(pow_data.get("difficulty") or "0"))
