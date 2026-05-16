@@ -13,6 +13,7 @@ import {
   MessageSquareText,
   PlugZap,
   Radio,
+  RefreshCw,
   Route,
   Send,
   ShieldCheck,
@@ -25,6 +26,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import { cn } from "@/lib/utils";
@@ -66,12 +68,34 @@ function chatCompletionsEndpoint(baseUrl: string) {
   return normalized.endsWith("/v1") ? `${normalized}/chat/completions` : `${normalized}/v1/chat/completions`;
 }
 
+function modelsEndpoint(baseUrl: string) {
+  return `${openAICompatibleBaseUrl(baseUrl)}/models`;
+}
+
 function openAICompatibleBaseUrl(baseUrl: string) {
   const normalized = normalizeBaseUrl(baseUrl);
   if (!normalized) {
     return "/v1";
   }
   return normalized.endsWith("/v1") ? normalized : `${normalized}/v1`;
+}
+
+function modelIdsFromResponse(value: unknown) {
+  const data = (value as { data?: unknown }).data;
+  if (!Array.isArray(data)) {
+    return [];
+  }
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const item of data) {
+    const id = String((item as { id?: unknown })?.id || "").trim();
+    if (!id || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
 }
 
 function extractDelta(payload: string) {
@@ -207,6 +231,8 @@ export default function ChatPage() {
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [model, setModel] = useState("auto");
+  const [loadedModelOptions, setModelOptions] = useState<string[]>([]);
+  const [isLoadingModels, setIsLoadingModels] = useState(false);
   const [prompt, setPrompt] = useState("Reply exactly: OK");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
@@ -217,6 +243,11 @@ export default function ChatPage() {
 
   const endpoint = useMemo(() => chatCompletionsEndpoint(baseUrl), [baseUrl]);
   const clientBaseUrl = useMemo(() => openAICompatibleBaseUrl(baseUrl), [baseUrl]);
+  const modelListEndpoint = useMemo(() => modelsEndpoint(baseUrl), [baseUrl]);
+  const modelOptions = useMemo(() => {
+    const current = model.trim() || "auto";
+    return Array.from(new Set(["auto", current, ...loadedModelOptions].filter(Boolean)));
+  }, [loadedModelOptions, model]);
   const curlSnippet = useMemo(() => buildCurlSnippet(baseUrl, apiKey, model), [apiKey, baseUrl, model]);
   const openaiSnippet = useMemo(() => buildOpenAISnippet(baseUrl, apiKey, model), [apiKey, baseUrl, model]);
   const canSend = Boolean(prompt.trim()) && Boolean(apiKey.trim()) && !isStreaming;
@@ -261,6 +292,37 @@ export default function ChatPage() {
     abortRef.current?.abort();
     abortRef.current = null;
     setIsStreaming(false);
+  };
+
+  const loadModels = async () => {
+    const key = apiKey.trim();
+    if (!key) {
+      toast.error("先填写 API Key，才能读取 /v1/models");
+      return;
+    }
+    setIsLoadingModels(true);
+    try {
+      const response = await fetch(modelListEndpoint, {
+        headers: {
+          Authorization: `Bearer ${key}`,
+        },
+      });
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "");
+        throw new Error(errorText || `HTTP ${response.status}`);
+      }
+      const ids = modelIdsFromResponse(await response.json());
+      if (!ids.length) {
+        throw new Error("/v1/models 没有返回可用模型");
+      }
+      setModelOptions(ids);
+      toast.success(`已加载 ${ids.length} 个模型`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "模型列表加载失败";
+      toast.error(message);
+    } finally {
+      setIsLoadingModels(false);
+    }
   };
 
   const sendMessage = async () => {
@@ -549,8 +611,38 @@ export default function ChatPage() {
 
               <label className="space-y-2">
                 <span className="text-[11px] font-black uppercase tracking-[0.18em] text-stone-400">Model</span>
-                <Input value={model} onChange={(event) => setModel(event.target.value)} placeholder="auto" />
-                <p className="text-xs leading-5 text-stone-500">文本建议先用 <code className="rounded bg-stone-100 px-1 py-0.5">auto</code>。</p>
+                <div className="flex gap-2">
+                  {loadedModelOptions.length ? (
+                    <Select value={model.trim() || "auto"} onValueChange={setModel}>
+                      <SelectTrigger className="min-w-0 flex-1 bg-white">
+                        <SelectValue placeholder="auto" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {modelOptions.map((item) => (
+                          <SelectItem key={item} value={item}>
+                            {item}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  ) : (
+                    <Input className="min-w-0 flex-1" value={model} onChange={(event) => setModel(event.target.value)} placeholder="auto" />
+                  )}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-11 rounded-2xl bg-white px-3"
+                    onClick={() => void loadModels()}
+                    disabled={isLoadingModels}
+                  >
+                    <RefreshCw className={cn("size-4", isLoadingModels ? "animate-spin" : "")} />
+                    {loadedModelOptions.length ? "刷新" : "加载"}
+                  </Button>
+                </div>
+                <p className="text-xs leading-5 text-stone-500">
+                  文本建议先用 <code className="rounded bg-stone-100 px-1 py-0.5">auto</code>。点击加载会读取{" "}
+                  <code className="rounded bg-stone-100 px-1 py-0.5">{modelListEndpoint}</code>。
+                </p>
               </label>
             </CardContent>
           </Card>
