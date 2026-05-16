@@ -18,7 +18,6 @@ import requests
 import urllib3
 from curl_cffi import requests as curl_requests
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from services.account_service import account_service
 from services.cpa_push_service import push_cpa_auth_file
@@ -322,8 +321,7 @@ def create_session(proxy: str = "") -> Any:
     if _is_socks_proxy(proxy):
         return curl_requests.Session(impersonate="chrome", verify=False, proxy=proxy)
     session = requests.Session()
-    retry = Retry(total=2, connect=2, read=2, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504))
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+    adapter = HTTPAdapter(max_retries=0, pool_connections=100, pool_maxsize=100)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     session.verify = False
@@ -332,15 +330,33 @@ def create_session(proxy: str = "") -> Any:
     return session
 
 
-def request_with_local_retry(session: requests.Session, method: str, url: str, retry_attempts: int = 3, **kwargs):
+def request_with_local_retry(
+    session: requests.Session,
+    method: str,
+    url: str,
+    retry_attempts: int = 3,
+    retry_statuses: tuple[int, ...] = (),
+    **kwargs,
+):
+    kwargs.setdefault("timeout", default_timeout)
     last_error = ""
-    for _ in range(max(1, retry_attempts)):
+    last_resp = None
+    attempts = max(1, retry_attempts)
+    for attempt in range(attempts):
         try:
-            return session.request(method.upper(), url, timeout=default_timeout, **kwargs), ""
+            resp = session.request(method.upper(), url, **kwargs)
         except Exception as error:
             last_error = str(error)
-            time.sleep(1)
-    return None, last_error
+            if attempt < attempts - 1:
+                time.sleep(0.5 * (attempt + 1))
+            continue
+        if getattr(resp, "status_code", None) in retry_statuses and attempt < attempts - 1:
+            last_resp = resp
+            last_error = f"http_{resp.status_code}"
+            time.sleep(0.5 * (attempt + 1))
+            continue
+        return resp, ""
+    return last_resp, last_error
 
 
 def validate_otp(session: requests.Session, device_id: str, code: str):
@@ -394,7 +410,21 @@ def extract_oauth_callback_params_from_consent_session(session: requests.Session
         consent_url = f"{auth_base}{consent_url}"
     current_url = consent_url
     for _ in range(10):
-        response = session.get(current_url, headers=navigate_headers, verify=False, timeout=30, allow_redirects=False)
+        callback_params = extract_oauth_callback_params_from_url(current_url)
+        if callback_params:
+            return callback_params
+        response, error = request_with_local_retry(
+            session,
+            "get",
+            current_url,
+            headers=navigate_headers,
+            verify=False,
+            timeout=20,
+            allow_redirects=False,
+            retry_statuses=(429, 500, 502, 503, 504),
+        )
+        if response is None:
+            raise RuntimeError(error or "consent_navigation_failed")
         callback_params = extract_oauth_callback_params_from_url(str(response.url)) or extract_oauth_callback_params_from_url(str(response.headers.get("Location") or "").strip())
         if callback_params:
             return callback_params
@@ -418,7 +448,19 @@ def extract_oauth_callback_params_from_consent_session(session: requests.Session
     headers["referer"] = consent_url
     headers["oai-device-id"] = device_id
     headers.update(_make_trace_headers())
-    ws_resp = session.post(f"{auth_base}/api/accounts/workspace/select", json={"workspace_id": workspace_id}, headers=headers, verify=False, timeout=30, allow_redirects=False)
+    ws_resp, error = request_with_local_retry(
+        session,
+        "post",
+        f"{auth_base}/api/accounts/workspace/select",
+        json={"workspace_id": workspace_id},
+        headers=headers,
+        verify=False,
+        timeout=20,
+        allow_redirects=False,
+        retry_statuses=(429, 500, 502, 503, 504),
+    )
+    if ws_resp is None:
+        raise RuntimeError(error or "workspace_select_failed")
     callback_params = extract_oauth_callback_params_from_url(str(ws_resp.headers.get("Location") or "").strip())
     if callback_params:
         return callback_params
@@ -437,7 +479,19 @@ def extract_oauth_callback_params_from_consent_session(session: requests.Session
     body = {"org_id": org_id}
     if project_id:
         body["project_id"] = project_id
-    org_resp = session.post(f"{auth_base}/api/accounts/organization/select", json=body, headers=org_headers, verify=False, timeout=30, allow_redirects=False)
+    org_resp, error = request_with_local_retry(
+        session,
+        "post",
+        f"{auth_base}/api/accounts/organization/select",
+        json=body,
+        headers=org_headers,
+        verify=False,
+        timeout=20,
+        allow_redirects=False,
+        retry_statuses=(429, 500, 502, 503, 504),
+    )
+    if org_resp is None:
+        raise RuntimeError(error or "organization_select_failed")
     return extract_oauth_callback_params_from_url(str(org_resp.headers.get("Location") or "").strip())
 
 
@@ -455,19 +509,31 @@ def exchange_oauth_callback_params(code_verifier: str, callback_params: dict[str
     code = str(callback_params.get("code") or "").strip()
     if not code:
         return None
-    resp = create_session(config["proxy"]).post(
-        f"{auth_base}/oauth/token",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": platform_oauth_redirect_uri,
-            "client_id": platform_oauth_client_id,
-            "code_verifier": code_verifier,
-        },
-        verify=False,
-        timeout=60,
-    )
+    session = create_session(config["proxy"])
+    try:
+        resp, error = request_with_local_retry(
+            session,
+            "post",
+            f"{auth_base}/oauth/token",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": platform_oauth_redirect_uri,
+                "client_id": platform_oauth_client_id,
+                "code_verifier": code_verifier,
+            },
+            verify=False,
+            timeout=20,
+            retry_statuses=(429, 500, 502, 503, 504),
+        )
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+    if resp is None:
+        raise RuntimeError(error or "oauth_token_exchange_failed")
     data = _response_json(resp)
     if resp.status_code != 200 or not data.get("access_token") or not data.get("refresh_token") or not data.get("id_token"):
         return None
@@ -531,8 +597,17 @@ class PlatformRegistrar:
             "code_challenge_method": "S256",
             "auth0Client": platform_auth0_client,
         }
-        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
-        if resp is None or resp.status_code != 200:
+        resp, error = request_with_local_retry(
+            self.session,
+            "get",
+            f"{auth_base}/api/accounts/authorize?{urlencode(params)}",
+            headers=self._navigate_headers(f"{platform_base}/"),
+            allow_redirects=False,
+            verify=False,
+            timeout=20,
+            retry_statuses=(429, 500, 502, 503, 504),
+        )
+        if resp is None or resp.status_code not in (200, 301, 302, 303, 307, 308):
             err = _response_json(resp).get("error", {}) if resp is not None else {}
             detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""
             raise RuntimeError(error or f"platform_authorize_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
@@ -599,7 +674,16 @@ class PlatformRegistrar:
             "code_challenge_method": "S256",
             "auth0Client": platform_auth0_client,
         }
-        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
+        resp, error = request_with_local_retry(
+            self.session,
+            "get",
+            f"{auth_base}/api/accounts/authorize?{urlencode(params)}",
+            headers=self._navigate_headers(f"{platform_base}/"),
+            allow_redirects=False,
+            verify=False,
+            timeout=20,
+            retry_statuses=(429, 500, 502, 503, 504),
+        )
         if resp is None:
             raise RuntimeError(error or "platform_login_authorize_failed")
         step(index, "登录 authorize 完成")
