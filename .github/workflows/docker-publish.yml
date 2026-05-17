@@ -74,7 +74,7 @@ jobs:
           target: app
           platforms: linux/amd64
           outputs: type=docker,dest=/tmp/chatgpt2api.tar
-          tags: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          tags: ghcr.io/${{ toLower(github.repository_owner) }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
