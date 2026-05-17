@@ -753,6 +753,134 @@ class YydsMailProvider(BaseMailProvider):
         self.session.close()
 
 
+class KaisouMailProvider(BaseMailProvider):
+    name = "kaisoumail"
+    retry_statuses = {429, 500, 502, 503, 504}
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        self.api_base = str(entry.get("api_base") or "https://km.707979.xyz").rstrip("/")
+        self.api_key = str(entry["api_key"]).strip()
+        self.session = requests.Session()
+        self.session.trust_env = False
+        self.session.headers.update({
+            "User-Agent": conf["user_agent"],
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        })
+
+    def _request(self, method: str, path: str, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200,)):
+        last_error = ""
+        for attempt in range(3):
+            try:
+                resp = self.session.request(
+                    method.upper(),
+                    f"{self.api_base}{path}",
+                    params=params,
+                    json=payload,
+                    timeout=self.conf["request_timeout"],
+                    verify=False,
+                )
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"KaisouMail 请求异常: {method} {path}, error={last_error}") from exc
+            if resp.status_code in expected:
+                break
+            if resp.status_code in self.retry_statuses and attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            raise RuntimeError(f"KaisouMail 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
+        else:
+            raise RuntimeError(f"KaisouMail 请求异常: {method} {path}, error={last_error}")
+        if resp.status_code == 204:
+            return {}
+        data = resp.json()
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(f"KaisouMail 请求失败: {data.get('error')}")
+        return data
+
+    @staticmethod
+    def _items(data: Any) -> list[dict[str, Any]]:
+        items = data.get("messages") if isinstance(data, dict) else data
+        return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        data = self._request(
+            "POST",
+            "/api/mailboxes",
+            payload={"localPart": username or _random_mailbox_name(), "expiresInMinutes": None},
+            expected=(200, 201),
+        )
+        address = str(data.get("address") or "").strip()
+        mailbox_id = str(data.get("id") or data.get("mailboxId") or "").strip()
+        if not address:
+            raise RuntimeError("KaisouMail 缺少 address")
+        created_at = str(data.get("createdAt") or data.get("created_at") or datetime.now(timezone.utc).isoformat()).strip()
+        domain = str(data.get("mailDomain") or data.get("rootDomain") or (address.rsplit("@", 1)[-1] if "@" in address else "")).strip().lower()
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "mailbox_id": mailbox_id,
+            "created_at": created_at,
+            "domain": domain,
+        }
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        address = str(mailbox.get("address") or "").strip()
+        params = {"mailbox": address}
+        since = str(mailbox.get("created_at") or "").strip()
+        if since:
+            params["since"] = since
+        data = self._request("GET", "/api/messages", params=params)
+        messages = self._items(data)
+        if not messages:
+            return None
+        item = max(
+            messages,
+            key=lambda value: (
+                (_parse_received_at(value.get("receivedAt") or value.get("received_at") or value.get("date") or value.get("timestamp")) or datetime.fromtimestamp(0, tz=timezone.utc)).timestamp(),
+                str(value.get("id") or ""),
+            ),
+        )
+        verification = item.get("verification") if isinstance(item.get("verification"), dict) else {}
+        code = str(verification.get("code") or "").strip()
+        if code:
+            return {
+                "provider": self.name,
+                "mailbox": address,
+                "message_id": str(item.get("id") or ""),
+                "subject": str(item.get("subject") or ""),
+                "sender": str(item.get("fromAddress") or item.get("from_address") or item.get("fromName") or ""),
+                "text_content": f"Verification code: {code}",
+                "html_content": "",
+                "received_at": _parse_received_at(item.get("receivedAt") or item.get("received_at") or item.get("date") or item.get("timestamp")),
+                "raw": item,
+            }
+        message_id = str(item.get("id") or "").strip()
+        detail = self._request("GET", f"/api/messages/{message_id}") if message_id else {"message": item}
+        message = detail.get("message") if isinstance(detail, dict) and isinstance(detail.get("message"), dict) else detail
+        text_content, html_content = _extract_content(message if isinstance(message, dict) else {})
+        return {
+            "provider": self.name,
+            "mailbox": address,
+            "message_id": message_id,
+            "subject": str(message.get("subject") or item.get("subject") or "") if isinstance(message, dict) else str(item.get("subject") or ""),
+            "sender": str(message.get("fromAddress") or message.get("from_address") or message.get("fromName") or item.get("fromAddress") or "") if isinstance(message, dict) else str(item.get("fromAddress") or ""),
+            "text_content": text_content,
+            "html_content": html_content,
+            "received_at": _parse_received_at((message.get("receivedAt") or message.get("received_at") or message.get("date") or message.get("timestamp")) if isinstance(message, dict) else (item.get("receivedAt") or item.get("received_at") or item.get("date") or item.get("timestamp"))),
+            "raw": detail,
+        }
+
+    def close(self) -> None:
+        self.session.close()
+
+
 def _entries(mail_config: dict) -> list[dict]:
     return [{**item, "provider_ref": f"{item['type']}#{index + 1}"} for index, item in enumerate(mail_config["providers"])]
 
@@ -793,6 +921,8 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
         return InbucketMailProvider(entry, conf)
     if entry["type"] == "yyds_mail":
         return YydsMailProvider(entry, conf)
+    if entry["type"] == "kaisoumail":
+        return KaisouMailProvider(entry, conf)
     raise RuntimeError(f"不支持的 mail.provider: {entry['type']}")
 
 
